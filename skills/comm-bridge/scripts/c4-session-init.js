@@ -13,17 +13,93 @@
  * Usage: node c4-session-init.js
  */
 
-import { logHookTiming } from './c4-diagnostic.js';
-import { formatSection } from './session-format.js';
-import { withinBudget } from '../../activity-monitor/scripts/shard-registry.js';
+let logHookTiming=()=>{},formatSection,withinBudget;
+async function normalHelpers(){
+ if(formatSection)return;
+ const [diagnostic,format,registry]=await Promise.all([import('./c4-diagnostic.js'),import('./session-format.js'),import('../../activity-monitor/scripts/shard-registry.js')]);
+ logHookTiming=diagnostic.logHookTiming;formatSection=format.formatSection;withinBudget=registry.withinBudget;
+}
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { createRequire } from 'node:module';
+const require=createRequire(import.meta.url);
+
+// Ordinary entrypoints only consult the explicit active marker. Historical
+// transactions are inspected by upgrade admission and explicit recovery tools.
+function hasRecoveryMaterials(root) {
+  const present = file => {
+    try { return fs.lstatSync(file); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  };
+  try {
+    for (const relative of ['.zylos', '.zylos/upgrade']) {
+      const file = path.join(root, relative), stat = present(file);
+      if (!stat) continue;
+      if (stat.isSymbolicLink()) {
+        if (relative !== '.zylos' || !fs.statSync(file).isDirectory()) return true;
+      } else if (!stat.isDirectory()) return true;
+    }
+    return !!present(path.join(root, '.zylos/upgrade/active.json'));
+  } catch { return true; }
+}
+
+function recoveryContext() {
+  try {
+    const root = fs.realpathSync(process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'));
+    if (!hasRecoveryMaterials(root)) return null;
+    const directory = path.join(root, '.zylos', 'upgrade');
+    const entry = path.join(directory, 'bootstrap.cjs');
+    for (const [parent, shared] of [[path.join(root, '.zylos'), true], [directory, false]]) {
+      const stat = fs.lstatSync(parent);
+      if (!stat.isDirectory() || stat.isSymbolicLink() ||
+          (process.getuid && stat.uid !== process.getuid()) || (!shared && (stat.mode & 0o022))) {
+        throw Error('untrusted stable upgrade discovery directory');
+      }
+    }
+    for (const [file, isDirectory] of [
+      [directory, true],
+      ...['bootstrap.cjs', 'maintenance.cjs'].map(name => [path.join(directory, name), false]),
+    ]) {
+      const stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink() || (isDirectory ? !stat.isDirectory() : !stat.isFile()) ||
+          (process.getuid && stat.uid !== process.getuid()) || (stat.mode & 0o022)) {
+        throw Error('untrusted stable upgrade discovery material');
+      }
+    }
+    const context = require(entry).bootstrap(root);
+    return context.active ? context : null;
+  } catch {
+    return {
+      active: true, blocked: true, recovery_required: true,
+      prompt: 'SYSTEM RECOVERY TASK: Upgrade discovery failed. Keep normal C4/database access isolated. Use only the fixed file-only upgrade status entry after verifying its ownership and permissions. Preserve transaction materials; report recovery_required if trusted discovery remains unavailable. Do not query C4 or execute journal command strings.',
+    };
+  }
+}
+
+function recoveryBlock(context) {
+  return `=== UPGRADE RECOVERY TASK ===\n${context.prompt}\n=== END UPGRADE RECOVERY TASK ===`;
+}
+
+function needsRecoveryCue(context) {
+  return context && (context.blocked || !context.controllerAlive);
+}
 
 async function withC4Db(label, action) {
+  const recovery = recoveryContext();
+  // Checkpoint owns the fallback cue. Conversation shard only suppresses C4,
+  // preventing three copies across initial prompt and the two C4 shards.
+  const cue = label === 'c4 checkpoint init' && needsRecoveryCue(recovery)
+    ? recoveryBlock(recovery) : '';
+  if (recovery?.blocked) return cue;
   let close = () => {};
   try {
+    await normalHelpers();
     const db = await import('./c4-db.js');
     close = db.close;
-    return await action(db);
+    const normal = await action(db);
+    return cue ? [normal, cue].filter(Boolean).join('\n\n') : normal;
   } catch (err) {
     const wrapped = new Error(`Error in ${label}: ${err.message}`);
     wrapped.cause = err;
@@ -144,6 +220,8 @@ export async function emitC4Conversations(_payload, budget = null) {
 
 export async function initC4Session() {
   try {
+    const recovery = recoveryContext();
+    if (recovery?.blocked) return needsRecoveryCue(recovery) ? recoveryBlock(recovery) + '\n' : '';
     const sections = [await emitC4Checkpoint(), await emitC4Conversations()].filter(Boolean);
     return `${sections.join('\n\n')}\n`;
   } catch (err) {
@@ -172,6 +250,12 @@ function main() {
   });
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+// The module URL is canonicalized by Node, while argv may retain a macOS
+// /var alias (or another directory symlink). Recovery cues must still run.
+function isMainModule() {
+  try { return !!process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return false; }
+}
+if (isMainModule()) {
   main();
 }
