@@ -18,7 +18,7 @@ import {
 import { downloadArchive, downloadBranch } from './download.js';
 import { fetchLatestTag, fetchRawFile, compareSemverDesc, sanitizeError } from './github.js';
 import { copyTree, syncTree } from './fs-utils.js';
-import { applyCaddyRoutes } from './caddy.js';
+import { applyCaddyRoutes, checkCaddyRouteMarkers, isCaddyAvailable, removeCaddyRoutes } from './caddy.js';
 import { smartSync, formatMergeResult } from './smart-merge.js';
 import { restartFromEcosystem, restartManagedProcess } from './pm2.js';
 
@@ -509,33 +509,67 @@ function step9_commitBaseline(ctx) {
 }
 
 /**
- * Step 6: update Caddy routes (if http_routes declared in SKILL.md)
+ * Step 6: reconcile Caddy routes with the new SKILL.md declaration.
  */
-function step6_updateCaddyRoutes(ctx) {
+export function step6_updateCaddyRoutes(ctx, deps = {}) {
   const startTime = Date.now();
-  const parsed = parseSkillMd(ctx.skillDir);
-  const httpRoutes = parsed?.frontmatter?.http_routes;
+  try {
+    const parsed = (deps.parseSkillMd || parseSkillMd)(ctx.skillDir);
+    if (!parsed?.frontmatter) {
+      return { step: 6, name: 'caddy_routes', status: 'skipped', message: 'SKILL.md metadata unavailable', duration: Date.now() - startTime };
+    }
+    const httpRoutes = parsed?.frontmatter?.http_routes;
+    if (httpRoutes != null && !Array.isArray(httpRoutes)) {
+      const notice = `Could not reconcile Caddy routes for ${ctx.component}: http_routes must be an array.`;
+      return { step: 6, name: 'caddy_routes', status: 'skipped', message: 'invalid http_routes', notice, caddy: { action: 'skipped', notice }, duration: Date.now() - startTime };
+    }
 
-  if (!httpRoutes || !Array.isArray(httpRoutes) || httpRoutes.length === 0) {
-    return { step: 6, name: 'caddy_routes', status: 'skipped', message: 'no http_routes', duration: Date.now() - startTime };
-  }
+    if (!httpRoutes || httpRoutes.length === 0) {
+      const inspection = (deps.checkCaddyRouteMarkers || checkCaddyRouteMarkers)(ctx.component);
+      if (inspection.readError) {
+        const notice = `Could not inspect Caddyfile (${inspection.readError}); remove any old managed routes for ${ctx.component} manually.`;
+        return { step: 6, name: 'caddy_routes', status: 'skipped', message: inspection.readError, notice, caddy: { action: 'skipped', notice }, duration: Date.now() - startTime };
+      }
+      if (!inspection.success) {
+        return { step: 6, name: 'caddy_routes', status: 'skipped', message: inspection.error, caddy: { action: 'skipped', error: inspection.error }, duration: Date.now() - startTime };
+      }
+      if (!inspection.blocks.length) {
+        return { step: 6, name: 'caddy_routes', status: 'skipped', message: 'no http_routes', duration: Date.now() - startTime };
+      }
 
-  const result = applyCaddyRoutes(ctx.component, httpRoutes);
-  if (result.success) {
-    return { step: 6, name: 'caddy_routes', status: 'done', message: result.action, caddy: result, duration: Date.now() - startTime };
+      if (!(deps.isCaddyAvailable || isCaddyAvailable)()) {
+        const notice = `Zylos-managed Caddy is unavailable; remove the old managed routes for ${ctx.component} from the Caddyfile manually.`;
+        return { step: 6, name: 'caddy_routes', status: 'skipped', message: 'manual route removal required', caddy: { action: 'skipped', error: 'caddy_not_available', notice }, notice, duration: Date.now() - startTime };
+      }
+      const removed = (deps.removeCaddyRoutes || removeCaddyRoutes)(ctx.component);
+      if (removed.success && removed.action === 'removed') {
+        const notice = ['New version declares no HTTP routes; removed old managed Caddy route blocks.', removed.notice].filter(Boolean).join(' ');
+        const caddy = { ...removed, notice };
+        return { step: 6, name: 'caddy_routes', status: 'done', message: 'removed', caddy, notice, duration: Date.now() - startTime };
+      }
+      if (removed.success && removed.action === 'not_found') {
+        return { step: 6, name: 'caddy_routes', status: 'skipped', message: 'old managed routes already absent', duration: Date.now() - startTime };
+      }
+      const notice = `Could not remove old managed Caddy routes for ${ctx.component}: ${removed.error}`;
+      return { step: 6, name: 'caddy_routes', status: 'skipped', message: removed.error, caddy: { ...removed, action: 'skipped', notice }, notice, duration: Date.now() - startTime };
+    }
+
+    const result = (deps.applyCaddyRoutes || applyCaddyRoutes)(ctx.component, httpRoutes);
+    if (result.success) {
+      return { step: 6, name: 'caddy_routes', status: 'done', message: result.action, caddy: result, notice: result.notice, duration: Date.now() - startTime };
+    }
+    if (result.action === 'manual_required') {
+      return {
+        step: 6, name: 'caddy_routes', status: 'skipped',
+        message: 'manual configuration required', caddy: result,
+        notice: result.notice, duration: Date.now() - startTime,
+      };
+    }
+    // Caddy failures are non-fatal for upgrades.
+    return { step: 6, name: 'caddy_routes', status: 'skipped', message: result.error, caddy: result, notice: result.notice, duration: Date.now() - startTime };
+  } catch (err) {
+    return { step: 6, name: 'caddy_routes', status: 'skipped', message: `Caddy route step skipped: ${err.message}`, caddy: { action: 'skipped', error: err.message, portSource: 'default' }, duration: Date.now() - startTime };
   }
-  if (result.action === 'manual_required') {
-    return {
-      step: 6,
-      name: 'caddy_routes',
-      status: 'skipped',
-      message: 'manual configuration required',
-      caddy: result,
-      duration: Date.now() - startTime,
-    };
-  }
-  // Caddy failures are non-fatal for upgrades
-  return { step: 6, name: 'caddy_routes', status: 'skipped', message: result.error, caddy: result, duration: Date.now() - startTime };
 }
 
 /**
@@ -724,6 +758,16 @@ export function runUpgrade(component, { tempDir, newVersion, mode, jsonOutput, o
       success: false,
       error: `Component directory not found: ${ctx.skillDir}`,
       steps: [],
+    };
+  }
+
+  // This is the only new fatal Caddy condition. Check before step 1 stops the
+  // service or any installed file is changed, regardless of new http_routes.
+  const markerCheck = checkCaddyRouteMarkers(component);
+  if (!markerCheck.success) {
+    return {
+      action: 'upgrade', component, success: false, failedStep: 0,
+      error: markerCheck.error, steps: [], rollback: { performed: false, steps: [] },
     };
   }
 
