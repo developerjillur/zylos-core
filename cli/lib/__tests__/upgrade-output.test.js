@@ -29,6 +29,20 @@ test('successful protected upgrade reports retained snapshot states and terminal
  const reply=formatC4Reply('self-upgrade',{success:true,from:'1',to:'2',preInstallProtection:true,dbBackupDir:'/fixture/db/tx',databases:snapshots,archiveDir:'/fixture/archive/tx',cleanupWarnings:['terminal archive fsync pending']});
  assert.match(reply,/zylos-core upgraded: 1 -> 2/);assert.match(reply,/Pre-install protection: enabled/);assert.match(reply,/Database snapshots: \/fixture\/db\/tx/);assert.match(reply,/Archived recovery materials/);assert.match(reply,/terminal archive fsync pending/);assert.match(reply,/Rollback attempted=false completed=false stage=upgrade_complete/);assert.match(reply,/Recovery required: no/);
 });
+test('human and C4 upgrade output names accepted database schema extensions',()=>{
+ const data={success:true,from:'0.9.0',to:'0.9.1',preInstallProtection:true,databases:[
+  {source:'comm-bridge/c4.db',status:'present',userVersion:1,extensions:{tables:['conversation_archive'],columns:[]}},
+  {source:'scheduler/scheduler.db',status:'present',userVersion:1,extensions:{tables:[],columns:[{table:'tasks',column:'archive_id'}]}},
+ ]};
+ const human=formatSelfUpgradeProtection(data);
+ const c4=formatC4Reply('self-upgrade',data);
+ for(const output of [human,c4]) {
+  assert.match(output,/comm-bridge\/c4\.db: present \(schema 1\)/);
+  assert.match(output,/Accepted extra table: conversation_archive/);
+  assert.match(output,/scheduler\/scheduler\.db: present \(schema 1\)/);
+  assert.match(output,/Accepted extra column: tasks\.archive_id/);
+ }
+});
 test('verified preinstall abort and unknown legacy completion do not claim database rollback',()=>{
  const aborted=formatC4Reply('self-upgrade',{success:false,error:'boot gate failed',rollback:{attempted:false,completed:false,stage:'aborted_before_install',recovery_required:false}});assert.match(aborted,/attempted=false completed=false stage=aborted_before_install/);
  const unknown=formatSelfUpgradeProtection({rollback:{performed:true}});assert.match(unknown,/attempted=true completed=unknown stage=unknown/);
@@ -38,6 +52,11 @@ test('backup-only success reports verified snapshots and unavailable automatic r
  const text=formatSelfUpgradeProtection({success:true,preInstallProtection:false,backupOnly:true,automaticRecovery:false,dbSnapshotVerified:true,dbBackupDir:'/fixture/manual/db',manualRecovery:{required:false,dbBackupDir:'/fixture/manual/db',instructions:'Automatic database recovery unavailable; restore manually if upgrade fails.'}});
  assert.match(text,/verified/i);assert.match(text,/automatic.*(unavailable|disabled)/i);assert.match(text,/manual/i);assert.match(text,/\/fixture\/manual\/db/);
  assert.doesNotMatch(text,/maintenance remains active/);
+});
+test('same-version upgrade output reports its verified database snapshot',()=>{
+ const text=formatSelfUpgradeProtection({success:true,preInstallProtection:false,backupOnly:true,databaseMode:'unchanged',dbSnapshotVerified:true,dbBackupDir:'/fixture/manual/db',manualRecovery:{required:false,instructions:'Database versions were unchanged.'}});
+ assert.match(text,/Database snapshot: verified/);
+ assert.doesNotMatch(text,/installation not started/);
 });
 test('backup-only failure reports manual recovery without claiming automatic maintenance isolation',()=>{
  const text=formatC4Reply('self-upgrade',{success:false,error:'npm failed',preInstallProtection:false,backupOnly:true,automaticRecovery:false,dbSnapshotVerified:true,dbBackupDir:'/fixture/manual/db',manualRecovery:{required:true,dbBackupDir:'/fixture/manual/db',instructions:'Manual recovery required; automatic database recovery is unavailable.'}});

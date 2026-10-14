@@ -19,7 +19,7 @@ function fixture(t) {
   const owner=path.join(skillsDir,item.owner);fs.mkdirSync(owner,{recursive:true});
   fs.writeFileSync(path.join(owner,'package.json'),'{"type":"module"}');
   fs.mkdirSync(path.join(owner,'scripts'));
-  fs.writeFileSync(path.join(owner,item.schema),`export const supportsNewDatabase=true;export function inspectSchema(db){db.prepare('SELECT value FROM preserved').all();}`);
+  fs.writeFileSync(path.join(owner,item.schema),`export const supportsNewDatabase=true;export const TABLES={preserved:['value']};export function inspectSchema(db){db.prepare('SELECT value FROM preserved').all();return {extensions:{tables:[],columns:[]}};}`);
   fs.writeFileSync(path.join(owner,'scripts/sqlite-schema.js'),'export {}; // pre-chain compatibility fixture');
   fs.symlinkSync(path.resolve('skills',item.owner,'node_modules'),path.join(owner,'node_modules'));
   const file=path.join(root,item.source);fs.mkdirSync(path.dirname(file),{recursive:true});
@@ -57,11 +57,98 @@ function fixture(t) {
   for(const item of CORE_DATABASES)assert.doesNotThrow(()=>m.assertCoreDatabaseAvailable(root,path.join(root,item.source)));
  }
  const deps={zylosDir:root,skillsDir,protectionSupported:()=>false,getCurrentVersion:()=>({success:true,version:'old'}),
+  probeCoreDbVersions:()=>({needsMigration:true,databases:CORE_DATABASES.map((item,index)=>({source:item.source,status:'present',fromVersion:index?1:0,toVersion:1,needsMigration:index===0}))}),
+  rehearseCoreDbUpgrade:()=>({databases:[]}),
   step1:{zylosDir:root,skillsDir,backupDir:path.join(root,'code-backup')},
   step4:{execSync:command=>{snapshots();assert.equal(fs.readFileSync(state,'utf8'),'stopped');calls.push(command);return command.startsWith('npm pack')?'fixture.tgz':'';}},
   runInstalledFinalizer:ctx=>{assert.equal(ctx.backupOnly,true);assert.equal(ctx.preInstallProtection,false);return {success:true,steps:[]};}};
  return {root,skillsDir,tempDir,calls,deps,snapshots,untouchedMaintenance,state,pm2Calls,run:()=>runSelfUpgrade({tempDir,newVersion:'new'},deps)};
 }
+
+test('matching versions clean old rehearsals and snapshot databases without rehearsal or migration', t => {
+ const f=fixture(t);
+ const rehearsalRoot=path.join(f.root,'.backup/db');fs.mkdirSync(rehearsalRoot,{recursive:true});
+ const fixed=path.join(rehearsalRoot,'.rehearsal'),legacy=path.join(rehearsalRoot,'.rehearsal-old');
+ fs.mkdirSync(fixed);fs.mkdirSync(legacy);
+ const before=CORE_DATABASES.map(item=>fs.readFileSync(path.join(f.root,item.source)));
+ f.deps.probeCoreDbVersions=()=>({needsMigration:false,databases:CORE_DATABASES.map(item=>({source:item.source,status:'present',fromVersion:1,toVersion:1,needsMigration:false}))});
+ f.deps.preflightCoreDbUpgrade=()=>assert.fail('database preflight must be skipped');
+ f.deps.rehearseCoreDbUpgrade=()=>assert.fail('rehearsal must be skipped');
+ f.deps.step4={execSync:command=>{f.snapshots();assert.equal(fs.readFileSync(f.state,'utf8'),'stopped');f.calls.push(command);return command.startsWith('npm pack')?'fixture.tgz':'';}};
+ const result=f.run();
+ assert.equal(result.success,true,JSON.stringify(result));
+ assert.equal(result.dbBackupDir,f.snapshots());
+ assert.equal(result.dbSnapshotVerified,true);
+ assert.equal(f.calls.length,2);
+ assert.deepEqual(result.rehearsalCleanup.removed.sort(),[fixed,legacy].sort());
+ assert.equal(fs.existsSync(fixed),false);assert.equal(fs.existsSync(legacy),false);
+ assert.deepEqual(CORE_DATABASES.map(item=>fs.readFileSync(path.join(f.root,item.source))),before);
+ f.untouchedMaintenance();
+});
+test('an unsafe leftover rehearsal link rejects before service stop', t => {
+ const f=fixture(t),root=path.join(f.root,'.backup/db');fs.mkdirSync(root,{recursive:true});
+ const outside=path.join(f.root,'outside');fs.mkdirSync(outside);fs.symlinkSync(outside,path.join(root,'.rehearsal'));
+ const result=f.run();
+ assert.equal(result.success,false);assert.match(result.error,/Unsafe rehearsal copy/);
+ assert.equal(fs.readFileSync(f.state,'utf8'),'online');assert.equal(f.calls.length,0);
+ assert.equal(fs.lstatSync(path.join(root,'.rehearsal')).isSymbolicLink(),true);
+});
+
+test('matching versions back up and install a target without a protocol file', t => {
+ const f=fixture(t);
+ f.deps.probeCoreDbVersions=()=>({needsMigration:false,databases:CORE_DATABASES.map(item=>({source:item.source,status:'present',fromVersion:1,toVersion:1,needsMigration:false}))});
+ f.deps.preflightCoreDbUpgrade=()=>assert.fail('database preflight must be skipped');
+ f.deps.rehearseCoreDbUpgrade=()=>assert.fail('rehearsal must be skipped');
+ const result=f.run();
+ assert.equal(result.success,true,JSON.stringify(result));
+ assert.equal(result.databaseMode,'unchanged');
+ assert.equal(result.dbBackupDir,f.snapshots());
+ assert.equal(result.dbSnapshotVerified,true);
+ assert.equal(f.calls.length,2);
+ f.untouchedMaintenance();
+});
+
+test('one database needing migration retains preflight, rehearsal, and snapshot', t => {
+ const f=fixture(t);
+ let preflight=0,rehearsal=0;
+ f.deps.preflightCoreDbUpgrade=()=>{preflight++;return {databases:[]};};
+ f.deps.rehearseCoreDbUpgrade=()=>{rehearsal++;return {databases:[]};};
+ const result=f.run();
+ assert.equal(result.success,true,JSON.stringify(result));
+ assert.equal(preflight,1);
+ assert.equal(rehearsal,1);
+ assert.equal(result.dbBackupDir,f.snapshots());
+ assert.equal(f.calls.length,2);
+});
+
+test('real pre-stop rehearsal sees committed source WAL and rejects before service stop', t => {
+ const f=fixture(t);
+ delete f.deps.rehearseCoreDbUpgrade;
+ const target=path.join(f.tempDir,'skills');
+ fs.mkdirSync(path.join(f.tempDir,'cli/lib'),{recursive:true});
+ fs.writeFileSync(path.join(f.tempDir,'package.json'),'{"type":"module"}');
+ fs.copyFileSync(path.resolve('cli/lib/core-db-backup-worker.js'),path.join(f.tempDir,'cli/lib/core-db-backup-worker.js'));
+ for(const item of CORE_DATABASES){
+  const owner=path.join(target,item.owner);fs.mkdirSync(path.join(owner,'scripts'),{recursive:true});
+  fs.writeFileSync(path.join(owner,'package.json'),'{"type":"module"}');
+  fs.copyFileSync(path.join(f.skillsDir,item.owner,item.schema),path.join(owner,item.schema));
+ }
+ fs.writeFileSync(path.join(target,'comm-bridge/scripts/sqlite-schema.js'),
+  `export function migrateDatabase(db){const value=db.prepare('SELECT value FROM preserved').get().value;if(value!=='committed-in-WAL')throw Error('online backup missed committed WAL');throw Error('injected target migration rejection after WAL read');}`);
+ const source=path.join(f.root,'comm-bridge/c4.db');
+ const writer=new Database(source);t.after(()=>{if(writer.open)writer.close();});
+ writer.pragma('journal_mode=WAL');writer.pragma('wal_autocheckpoint=0');
+ writer.prepare('UPDATE preserved SET value=?').run('committed-in-WAL');
+ assert.ok(fs.statSync(source+'-wal').size>0);
+ const result=f.run();
+ assert.equal(result.success,false,JSON.stringify(result));
+ assert.match(result.error,/injected target migration rejection after WAL read/);
+ assert.equal(fs.readFileSync(f.state,'utf8'),'online');
+ assert.equal(f.calls.length,0);
+ assert.equal(fs.existsSync(f.pm2Calls),false);
+ assert.equal(writer.prepare('SELECT value FROM preserved').get().value,'committed-in-WAL');
+ f.untouchedMaintenance();
+});
 
 for(const platform of ['linux','darwin'])test(`${platform} without automatic recovery still publishes and verifies three databases before npm`,t=>{
  const f=fixture(t);f.deps.platform=platform;const result=f.run();

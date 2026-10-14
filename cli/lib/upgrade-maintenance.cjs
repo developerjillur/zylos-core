@@ -106,7 +106,8 @@ function validateOriginalJournal(j, {
 function validateReadyJournal(j) {
   // data_ready releases normal business writers. Check durable records, never
   // current DB hashes: legitimate writes after data_ready must remain valid.
-  if (j.installationIntent !== true || j.dbBackupDir !== path.join(j.zylosDir, '.backup', 'db', j.transactionId) || typeof j.snapshotManifestHash !== 'string' || !/^[a-f0-9]{64}$/.test(j.snapshotManifestHash)) throw Error('invalid data-ready installation/material identity');
+  if (j.installationIntent !== true) throw Error('invalid data-ready installation identity');
+  if (j.dbBackupDir !== path.join(j.zylosDir, '.backup', 'db', j.transactionId) || typeof j.snapshotManifestHash !== 'string' || !/^[a-f0-9]{64}$/.test(j.snapshotManifestHash)) throw Error('invalid data-ready installation/material identity');
   validateOriginalJournal(j, {
     completeBackups: true
   });
