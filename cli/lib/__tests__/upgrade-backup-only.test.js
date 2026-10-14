@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {createRequire} from 'node:module';
 import vm from 'node:vm';
-import {runSelfUpgrade,createFinalizeState,runSelfUpgradeFinalize} from '../self-upgrade.js';
+import {runSelfUpgrade,createFinalizeState,runSelfUpgradeFinalize,resolveProtectedNpmCli} from '../self-upgrade.js';
 import {CORE_DATABASES,runCoreDbWorker} from '../core-db-backup.js';
 import {maintenance as m} from '../upgrade-protection.js';
 const require=createRequire(import.meta.url);
@@ -225,12 +225,48 @@ function capabilityModule({missingProc=false,missingFlock=false,platform='linux'
 test('Linux capability probe distinguishes trusted flock and present identity from each missing capability',()=>{
  assert.equal(capabilityModule().platformSupported('linux'),true,'positive control requires both capabilities');
  assert.equal(capabilityModule({missingFlock:true}).platformSupported('linux'),false);
+ assert.throws(()=>capabilityModule({missingFlock:true}).preflightExternalTools('linux'),/flock executable unavailable/);
  assert.equal(capabilityModule({missingProc:true}).identity().absent,true);
  assert.equal(capabilityModule({missingProc:true}).platformSupported('linux'),false);
 });
 
-for(const missing of ['missingFlock','missingProc'])test(`actual capability decision for Linux ${missing} still requires verified snapshots before installation`,t=>{
- const f=fixture(t),capability=capabilityModule({[missing]:true});
+test('missing Linux flock uses the backup-only path without protected tool preflight',t=>{
+ const f=fixture(t),capability=capabilityModule({missingFlock:true});
+ t.mock.method(m,'preflightExternalTools',()=>assert.fail('protected tool preflight must be skipped'));
+ f.deps.platform='linux';f.deps.protectionSupported=()=>capability.platformSupported('linux');
+ const result=f.run();assert.equal(result.success,true,JSON.stringify(result));
+ assert.equal(result.backupOnly,true);assert.equal(result.dbSnapshotVerified,true);
+ assert.equal(result.dbBackupDir,f.snapshots());assert.equal(f.calls.length,2);f.untouchedMaintenance();
+});
+
+test('missing npm entry rejects protected upgrade before stopping services',t=>{
+ const f=fixture(t);
+ process.env.PATH=path.join(f.root,'bin');
+ f.deps.protectionSupported=()=>true;
+ delete f.deps.step4;
+ f.deps.probeCoreDbVersions=()=>({needsMigration:false,databases:CORE_DATABASES.map(item=>({source:item.source,status:'present',fromVersion:1,toVersion:1,needsMigration:false}))});
+ const result=f.run();assert.equal(result.success,false);assert.match(result.error,/npm-cli.js entry is unavailable/);
+ assert.equal(fs.readFileSync(f.state,'utf8'),'online');assert.equal(f.calls.length,0);
+ assert.equal(fs.existsSync(f.pm2Calls),false);
+});
+
+test('backup-only upgrade accepts an npm wrapper that is not npm-cli.js',t=>{
+ const f=fixture(t),bin=path.join(f.root,'bin'),npmCalls=path.join(f.root,'npm-calls');
+ const ps=['/usr/bin/ps','/bin/ps'].find(file=>fs.existsSync(file));
+ if(ps)fs.symlinkSync(ps,path.join(bin,'ps'));
+ fs.writeFileSync(path.join(bin,'npm'),`#!${process.execPath}\nconst fs=require('node:fs');const args=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(npmCalls)},JSON.stringify(args)+'\\n');if(args[0]==='pack')process.stdout.write('fixture.tgz\\n');else if(args[0]!=='install')process.exit(19);\n`,{mode:0o700});
+ process.env.PATH=bin;
+ assert.throws(resolveProtectedNpmCli,/npm-cli.js entry is unavailable/);
+ delete f.deps.step4;
+ f.deps.probeCoreDbVersions=()=>({needsMigration:false,databases:CORE_DATABASES.map(item=>({source:item.source,status:'present',fromVersion:1,toVersion:1,needsMigration:false}))});
+ const result=f.run();assert.equal(result.success,true,JSON.stringify(result));
+ assert.equal(result.backupOnly,true);assert.equal(result.dbSnapshotVerified,true);
+ assert.equal(result.dbBackupDir,f.snapshots());
+ assert.deepEqual(fs.readFileSync(npmCalls,'utf8').trim().split('\n').map(JSON.parse).map(args=>args[0]),['pack','install']);
+});
+
+test('missing Linux process identity still requires verified snapshots before installation',t=>{
+ const f=fixture(t),capability=capabilityModule({missingProc:true});
  f.deps.platform='linux';f.deps.protectionSupported=()=>capability.platformSupported('linux');
  const result=f.run();assert.equal(result.success,true,JSON.stringify(result));
  assert.equal(result.backupOnly,true);assert.equal(result.dbSnapshotVerified,true);
