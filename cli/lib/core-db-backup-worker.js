@@ -11,11 +11,11 @@ const DATABASES = [
 ];
 const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 function driver(input, item) {
-  const root=input.schemaRoot || path.join(input.zylosDir,'.claude','skills');
+  const root=input.driverRoot || input.schemaRoot || path.join(input.zylosDir,'.claude','skills');
   const req = createRequire(path.join(root,item.owner,'package.json'));
   // Snapshot verification uses the frozen independent closure. Compatibility
   // preflight must load the actual owner's native dependency under this Node.
-  return req(['offline-preflight','upgrade-migrate'].includes(input.action) ? 'better-sqlite3' : (input.driverPath || 'better-sqlite3'));
+  return req(['offline-preflight','upgrade-migrate','version-probe'].includes(input.action) ? 'better-sqlite3' : (input.driverPath || 'better-sqlite3'));
 }
 function missing(file) {
   if (fs.existsSync(file)) return false;
@@ -62,7 +62,17 @@ async function ownerSchema(input,item) {
   try {
     const mod=await import(pathToFileURL(schemaPath));
     if(typeof mod.inspectSchema!=='function'||typeof mod.supportsNewDatabase!=='boolean') throw new Error('missing pure schema inspection contract');
-    return mod;
+    if (!mod.TABLES || typeof mod.TABLES !== 'object') throw new Error('missing schema table contract');
+    // Owners classify extensions against their own current layout. Older
+    // versions have no latest-layout comparison until their migration runs.
+    return {
+      ...mod,
+      inspectSchema(db, options = {}) {
+        const result = mod.inspectSchema(db, {...options, strict:false, rejectUnsafeExtensions:true});
+        if (!result.extensions || !Array.isArray(result.extensions.tables) || !Array.isArray(result.extensions.columns)) throw new Error('missing schema extension report');
+        return result;
+      }
+    };
   }catch(error){throw new Error(`Incompatible owner schema code ${item.owner}: ${error.message}`);}
 }
 async function migrationEngine(input) {
@@ -83,14 +93,64 @@ function authorizeMigration(input) {
   return j;
 }
 export async function execute(input) {
-  if(!['probe','snapshot','verify','offline-preflight','upgrade-migrate'].includes(input.action)) throw new Error(`Unknown action: ${input.action}`);
+  if(!['probe','snapshot','verify','offline-preflight','upgrade-migrate','rehearse','version-probe'].includes(input.action)) throw new Error(`Unknown action: ${input.action}`);
   if(input.action==='probe') {
     const Database=createRequire(import.meta.url)(input.driverPath); const db=new Database(':memory:');
     try {if(typeof db.backup!=='function') throw new Error('SQLite backup API unavailable');}finally{db.close();}
     return {ok:true};
   }
+  if(input.action==='version-probe') {
+    if (!input.schemaRoot || !input.driverRoot) throw Error('Version probe requires target schema and installed driver roots');
+    const rows=[];
+    for(const item of DATABASES) {
+      const mod=await ownerSchema(input,item);
+      const target=mod.SUPPORTED_SCHEMA_VERSION;
+      if(!Number.isInteger(target)||target<0) throw Error(`Invalid target schema version: ${item.owner}`);
+      const source=path.join(input.zylosDir,item.source);
+      if(missing(source)) {
+        rows.push({source:item.source,status:'missing',fromVersion:null,toVersion:target,needsMigration:true});
+        continue;
+      }
+      const Database=driver(input,item);
+      const db=new Database(source,{readonly:true,fileMustExist:true,timeout:5000});
+      let current;
+      try {current=db.pragma('user_version',{simple:true});} finally {db.close();}
+      if(!Number.isInteger(current)||current<0) throw Error(`${item.source}: invalid schema version ${current}`);
+      if(current>target) throw Error(`${item.source}: schema version ${current} exceeds supported ${target}; restore compatible code/data`);
+      rows.push({source:item.source,status:'present',fromVersion:current,toVersion:target,needsMigration:current<target});
+    }
+    return {databases:rows,needsMigration:rows.some(row=>row.needsMigration)};
+  }
   if(input.action==='upgrade-migrate') authorizeMigration(input);
-  const engine=['offline-preflight','upgrade-migrate'].includes(input.action) ? await migrationEngine(input) : null;
+  const engine=['offline-preflight','upgrade-migrate','rehearse'].includes(input.action) ? await migrationEngine(input) : null;
+  if(input.action==='rehearse') {
+    if (!input.schemaRoot || !input.driverRoot || !input.rehearsalDir) throw Error('Rehearsal requires target schema, installed driver, and private copy roots');
+    const directory=input.rehearsalDir;
+    const stat=fs.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw Error('Unsafe private rehearsal directory');
+    const reports=[];
+    try {
+      for(const item of DATABASES) {
+        const source=path.join(input.zylosDir,item.source);
+        const mod=await ownerSchema(input,item),Database=driver(input,item);
+        const absent=missing(source);
+        if(absent && !mod.supportsNewDatabase) throw Error(`Owner cannot initialize missing database: ${item.owner}`);
+        const target=path.join(directory,`${item.owner}.db`);
+        if(!absent) {
+          const live=new Database(source,{readonly:true,fileMustExist:true,timeout:5000});
+          try {await live.backup(target);} finally {live.close();}
+        }
+        const copy=new Database(target,{fileMustExist:!absent,timeout:5000});
+        try {
+          inspectConnection(copy);
+          const start=copy.pragma('user_version',{simple:true});
+          const result=engine.migrateDatabase(copy,mod,{allowNew:absent,strict:false});
+          reports.push({source:item.source,status:absent?'missing':'present',fromVersion:start,toVersion:result.version,extensions:result.extensions});
+        } catch(error) {throw Error(`${item.source}: rehearsal failed: ${error.message}`);} finally {copy.close();}
+      }
+      return {databases:reports};
+    } finally {fs.rmSync(directory,{recursive:true,force:true});}
+  }
   const plan=(db,mod,options={}) => {
     // A restored pre-chain owner still supplies its original readonly contract.
     if(typeof engine.planDatabaseMigration==='function') {
@@ -127,7 +187,7 @@ export async function execute(input) {
       if(absent) {const memory=new Database(':memory:');try {plan(memory,mod,{allowNew:true});}finally{memory.close();}}
       fs.mkdirSync(path.dirname(source),{recursive:true});
       const db=new Database(source,{fileMustExist:!absent,timeout:5000});
-      try {engine.migrateDatabase(db,mod,{allowNew:absent,strict:true});rows.push({source:item.source,status:'present',...inspectConnection(db)});}
+      try {const layout=engine.migrateDatabase(db,mod,{allowNew:absent,strict:true});rows.push({source:item.source,status:'present',...inspectConnection(db),extensions:layout.extensions});}
       finally {db.close();}
       continue;
     }
@@ -150,12 +210,12 @@ export async function execute(input) {
       let state;
       if (input.standaloneRestored === true) {
         if (input.manifest?.status !== 'complete' || expected?.status !== 'backed_up' || typeof expected.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(expected.sha256)) throw new Error('Missing standalone restored snapshot evidence');
-        state = withStandaloneReadonly(Database, source, expected.sha256, db => {plan(db,mod); return inspectConnection(db);});
+        state = withStandaloneReadonly(Database, source, expected.sha256, db => {const layout=plan(db,mod); return {...inspectConnection(db),extensions:layout.extensions};});
       } else {
         // Original/preinstall and active READY verification must see committed
         // live WAL data. Never treat those databases as standalone snapshots.
         const db=new Database(source,{readonly:true,fileMustExist:true,timeout:5000});
-        try {db.exec('BEGIN');plan(db,mod);state=inspectConnection(db);}
+        try {db.exec('BEGIN');const layout=plan(db,mod);state={...inspectConnection(db),extensions:layout.extensions};}
         finally {if(db.inTransaction)db.exec('ROLLBACK');db.close();}
       }
       rows.push({source:item.source,status:'present',...state});continue;

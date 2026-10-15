@@ -88,8 +88,68 @@ The CLI executes the post-upgrade hook (if declared) and restarts the service (i
 2. **Service restart**: read the `start_service` step. If it failed, manually restart with `pm2 restart <service-name>` and verify health.
 3. Compare old and new SKILL.md config — if new required config items were added, collect them interactively.
 4. **If `mergeConflicts` exists**: Review each conflict file. Read the backup (local version) and installed (new version), then re-apply local changes using Edit tool.
+5. **Review managed Caddy routes**: On upgrade, only the existing port is preserved for each managed path. The host and all other route settings (path, `strip_prefix`, headers) come from the new version, so manual edits to those settings in managed blocks are overwritten. If the Caddy route result has `notice`, include its text in the user-facing report. It may say that an existing port could not be determined and the new default target was used, or that routes removed from the new manifest caused old managed blocks to be deleted. If Caddy is unavailable, the notice calls for manual removal of old blocks. Check the deployed route when that matters for access.
 
 ## Session Mode — Self-Upgrade (zylos-core)
+
+### Core database schema extensions
+
+Self-upgrade first reads only the SQLite `user_version` of the C4,
+scheduler, and web-console databases. If all three versions match the target
+release, it skips database preflight, rehearsal copies, migrations,
+and upgrade structure/integrity checks. It still stops services, then creates
+and verifies all three database snapshots before installation. Protected mode retains code recovery;
+on same-version failure it leaves the live databases in place and retains the
+verified snapshots for manual database recovery. Backup-only mode requires
+manual recovery.
+If any database is older or missing, the full database path below applies. A
+version newer than the target is rejected before service stop.
+
+On the migration path, the upgrade accepts and reports additional tables and
+columns, copies them into the verified database snapshots, and preserves them
+through declared migration steps starting at schema version 1→2. The released
+legacy 0→1 step has no per-step change checks; its result must satisfy the v1
+required schema. There is no schema-extension opt-in flag.
+Show the user the reported database, table, and column names in the ordinary
+upgrade review. If a planned new core name is occupied, or a declared table
+deletion would remove user-added structure, the upgrade is blocked until the
+operator resolves the conflict outside the upgrade. Unsupported schema versions,
+an incomplete migration chain, SQLite integrity failures, missing or invalid
+backups, and failed applicable per-step or final checks also block the upgrade.
+Declared steps also verify retained column type, `NOT NULL`, default,
+primary-key position, and generated/hidden metadata. Intentional core column
+definition changes must be declared with `alterColumns`. Upgrade preflight and
+rehearsal reject a user-added ordinary `NOT NULL` column without a usable
+default in a core table. Ordinary database open still succeeds; writes to that
+table may fail with SQLite's `NOT NULL constraint failed` error, naming the
+column. Repair by adding a usable default, allowing `NULL`, or moving the data
+to a separate table. These checks cover table and column names, retained
+column metadata, and row counts.
+They do not inspect indexes, triggers, or views, and a core table rebuild can
+lose user-created indexes or triggers. A same-count edit can change row meaning
+without being detected, so review dependent objects and relevant content.
+
+When migration is needed, both protected and backup-only self-upgrades rehearse
+the target migration chain on isolated SQLite backup copies before service stop.
+A passed rehearsal is only an early warning check. After service stop, the
+updater takes and verifies the authoritative snapshots and reruns the full
+checks and migrations against the actual databases. Each database's chain is
+atomic. If a later database fails, protected recovery restores all three from
+the verified snapshots and compensates protected code. Backup-only mode
+requires manual recovery. The downloaded target must include rehearsal code on
+this path or the upgrade is rejected before service stop; this applies to
+`--branch` targets that point at older releases. Rehearsal copies live under
+private `.backup/db/.rehearsal` (0700). Normal exit or worker timeout removes
+it. The next upgrade checks and removes that directory and legacy
+`.rehearsal-*` copies before stopping services; a symlink, non-directory, or
+wrong-owner entry blocks cleanup. Formal snapshot groups are unaffected.
+
+An installed older updater runs preflight before the target release is installed.
+It may reject extra tables or columns and cannot use the new release's rules.
+If this blocks first adoption, follow
+[First adoption](https://github.com/zylos-ai/zylos-core/blob/main/docs/self-upgrade-recovery.md#first-adoption): verify a
+complete backup and row accounting, then use an operator-approved temporary
+relocation plan before running the old CLI. Do not discard the extension data.
 
 ### Step 1: Check + Download to Temp
 
@@ -123,6 +183,10 @@ After user confirms (with full knowledge of all changes). Confirm flow always us
 ```bash
 zylos upgrade --self --yes --json
 ```
+
+If preflight or rehearsal rejects an incompatibility, investigate the reported
+database and object before retrying. Review extension details with the user as
+part of the ordinary upgrade approval.
 
 The CLI handles: backup, npm install -g from downloaded package, smart merge Core Skills, sync CLAUDE.md, sync settings hooks, restart PM2 services, verify.
 
@@ -265,7 +329,8 @@ If already up to date, reply: `zylos-core is up to date (v0.1.0)`
 
 User: `upgrade zylos confirm`
 
-1. Run `zylos upgrade --self --yes --json`
+1. Run `zylos upgrade --self --yes --json`. If preflight or rehearsal reports
+   an incompatibility, resolve it before retrying; no schema-extension flag bypasses it.
 2. Deploy templates per user's decisions from Step 1 (new files: copy, changed: follow user choice, unchanged: skip)
 3. **If `mergeConflicts` in result**: Review and re-merge backed-up local changes
 4. If hooks/skills changed, execute restart-claude

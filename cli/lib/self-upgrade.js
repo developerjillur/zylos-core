@@ -43,7 +43,7 @@ import { createRequire as createFinalizerRequire } from 'node:module';
 const finalizerRequire=createFinalizerRequire(import.meta.url);
 function requireFinalizerExit(dir,j,terminate){return finalizerRequire(path.join(dir,'finalizer.cjs')).quiesce(dir,j,{terminate});}
 
-import { preflightCoreDbUpgrade } from './core-db-backup.js';
+import { cleanupCoreDbRehearsals, preflightCoreDbUpgrade, probeCoreDbVersions, rehearseCoreDbUpgrade } from './core-db-backup.js';
 import { beginUpgrade, beginBackupOnly, prepareBackupOnlyInstall, saveProtectedCode, prepareProtectedInstall, markInstallationIntent, recovery, protectedDataReady, protectedSuccess, maintenance, maintenanceFor } from './upgrade-protection.js';
 
 const REPO = 'zylos-ai/zylos-core';
@@ -642,7 +642,7 @@ export function step3_stopCoreServices(ctx, deps = {}) {
 export function resolveProtectedNpmCli() {
   for(const directory of String(process.env.PATH||'').split(path.delimiter)){
     if(!path.isAbsolute(directory))continue;
-    try{const file=fs.realpathSync(path.join(directory,'npm')),st=fs.statSync(file);if(path.basename(file)==='npm-cli.js'&&st.isFile()&&!(st.mode&0o022)&&[0,process.getuid?.()].includes(st.uid))return file;}catch{}
+    try{const file=fs.realpathSync(path.join(directory,'npm')),st=fs.statSync(file);if(path.basename(file)==='npm-cli.js'&&st.isFile()){fs.accessSync(file,fs.constants.R_OK);return file;}}catch{}
   }
   throw Error('trusted npm-cli.js entry is unavailable');
 }
@@ -679,7 +679,7 @@ export function step4_npmInstallGlobal(ctx, deps = {}) {
     // Pack first — creates a .tgz tarball (copies, not symlinks)
     if (ctx.preInstallProtection) markInstallationIntent(ctx);
     if(ctx.preInstallProtection&&!deps.execSync){
-      const npmCli=resolveProtectedNpmCli();
+      const npmCli=ctx.protectedNpmCli;
       const packed=runProtectedInstaller(ctx,{stage:'pack',npmCli,args:['pack','--pack-destination','.'],cwd:ctx.tempDir});
       const tarballName=packed.trim().split(/\r?\n/).at(-1);
       if(!tarballName||path.basename(tarballName)!==tarballName||!tarballName.endsWith('.tgz'))throw Error('npm pack returned an invalid tarball filename');
@@ -1518,14 +1518,16 @@ const POST_INSTALL_STEPS = [
 ];
 
 function backupOnlyResult(ctx, failed) {
-  if (!ctx.backupOnly) return ctx.preInstallProtection ? {automaticCompensation:true, automaticResume:process.platform !== 'darwin'} : {};
+  if (!ctx.backupOnly) return ctx.preInstallProtection ? {automaticCompensation:true, automaticResume:process.platform !== 'darwin', databaseMode:ctx.databaseMode || 'migrate', dbSnapshotVerified:ctx.dbSnapshotVerified===true, databases:ctx.databases || ctx.databasePreflight?.databases || null,...(ctx.rehearsalCleanup ? {rehearsalCleanup:ctx.rehearsalCleanup} : {})} : ctx.rehearsalCleanup ? {rehearsalCleanup:ctx.rehearsalCleanup} : {};
   return {
     backupOnly: true,
+    ...(ctx.rehearsalCleanup ? {rehearsalCleanup:ctx.rehearsalCleanup} : {}),
+    databaseMode: ctx.databaseMode || 'migrate',
     backupDir: ctx.backupDir || null,
     automaticRecovery: false,
     protectionUnavailableReason: ctx.protectionUnavailableReason,
     dbBackupDir: ctx.dbBackupDir || null,
-    databases: ctx.dbManifest?.databases || null,
+    databases: ctx.databases || ctx.databasePreflight?.databases || ctx.dbManifest?.databases || null,
     dbSnapshotVerified: Boolean(ctx.dbSnapshotVerified),
     backupWarnings: ctx.backupWarnings || [],
     preInstallServicesRestored: ctx.preInstallServicesRestored === true,
@@ -1585,7 +1587,7 @@ function buildSelfUpgradeResult(ctx, failedStep, rollbackResults = null, rollbac
     steps: ctx.steps,
     backupDir: ctx.backupDir,
     dbBackupDir: ctx.dbBackupDir || null,
-    databases: ctx.dbManifest?.databases || null,
+    databases: ctx.databases || ctx.databasePreflight?.databases || ctx.dbManifest?.databases || null,
     preInstallProtection: Boolean(ctx.preInstallProtection),
     transactionDir: ctx.transactionDir || null,
     cleanupWarnings: ctx.cleanupWarnings || [],
@@ -1601,6 +1603,7 @@ function buildSelfUpgradeResult(ctx, failedStep, rollbackResults = null, rollbac
 export function createFinalizeState(ctx) {
   return {
     schemaVersion: ctx.preInstallProtection ? 2 : 1,
+    ...(ctx.databaseMode ? {databaseMode:ctx.databaseMode} : {}),
     ...backupOnlyResult(ctx, false),
     ...(ctx.backupOnly ? {dbManifest:ctx.dbManifest} : {}),
     ...(ctx.preInstallProtection ? {
@@ -1701,11 +1704,13 @@ export function runSelfUpgradeFinalize(state = {}, deps = {}) {
     mode: state.mode,
   });
   ctx.backupOnly = state.backupOnly === true;
+  ctx.databaseMode = state.databaseMode === 'unchanged' ? 'unchanged' : 'migrate';
   ctx.protectionUnavailableReason = state.protectionUnavailableReason;
   ctx.dbSnapshotVerified = state.dbSnapshotVerified === true;
   ctx.backupWarnings = state.backupWarnings;
+  ctx.rehearsalCleanup = state.rehearsalCleanup;
   ctx.preInstallProtection = state.schemaVersion===2 && state.preInstallProtection===true;
-  ctx.transactionDir=state.transactionDir;ctx.transactionId=state.transactionId;ctx.coreManifest=state.coreManifest;ctx.dbBackupDir=state.dbBackupDir;ctx.dbManifest=state.dbManifest;
+  ctx.transactionDir=state.transactionDir;ctx.transactionId=state.transactionId;ctx.coreManifest=state.coreManifest;ctx.dbBackupDir=state.dbBackupDir;ctx.dbManifest=state.dbManifest;ctx.databases=state.databases || null;
   if(ctx.preInstallProtection){
     try {ctx.journal=maintenance.transaction(ZYLOS_DIR,ctx.transactionDir);if(!ctx.journal.installationIntent)throw Error('finalizer without durable installation intent');}
     catch(error){return {success:false,error:error.message,rollback:{attempted:false,completed:false,performed:false},recovery_required:true};}
@@ -1767,16 +1772,31 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps 
       const root = deps.zylosDir ?? ZYLOS_DIR;
       const prior = maintenance.discover(root);
       if (prior.candidates.length || prior.diagnostics.length || prior.marker) return {action:'self_upgrade',success:false,error:'unresolved prior upgrade transaction',preInstallProtection:false,rollback:{attempted:false,completed:false,performed:false},recovery_required:true};
-      (deps.preflightCoreDbUpgrade ?? preflightCoreDbUpgrade)(root);
+      ctx.rehearsalCleanup=(deps.cleanupCoreDbRehearsals ?? cleanupCoreDbRehearsals)(root);
+      ctx.databaseVersions=(deps.probeCoreDbVersions ?? probeCoreDbVersions)(root,ctx.tempDir,{driverRoot:deps.skillsDir ?? SKILLS_DIR});
+      if (!ctx.databaseVersions || typeof ctx.databaseVersions.needsMigration !== 'boolean' || !Array.isArray(ctx.databaseVersions.databases) || ctx.databaseVersions.databases.length !== 3) throw Error('Invalid database version probe result');
+      ctx.databaseMode=ctx.databaseVersions.needsMigration?'migrate':'unchanged';
+      if (ctx.databaseMode === 'migrate') {
+        ctx.databasePreflight=(deps.preflightCoreDbUpgrade ?? preflightCoreDbUpgrade)(root);
+        ctx.databaseRehearsal=(deps.rehearseCoreDbUpgrade ?? rehearseCoreDbUpgrade)(root,ctx.tempDir,{driverRoot:deps.skillsDir ?? SKILLS_DIR,onCleanup:cleanup=>ctx.rehearsalCleanup.removed.push(...cleanup.removed)});
+      }
     }
-    catch (error) { return {action:'self_upgrade',success:false,error:error.message,preInstallProtection:false,rollback:{attempted:false,completed:false,performed:false},recovery_required:false}; }
+    catch (error) { return {action:'self_upgrade',success:false,error:error.message,rehearsalCleanup:ctx.rehearsalCleanup || {removed:error.removedRehearsals || []},preInstallProtection:false,rollback:{attempted:false,completed:false,performed:false},recovery_required:false}; }
+  }
+  if (!deps.preInstallSteps && eligible) {
+    try {
+      maintenance.preflightExternalTools(platform);
+      if (!deps.step4?.execSync) ctx.protectedNpmCli = resolveProtectedNpmCli();
+    } catch (error) {
+      return {action:'self_upgrade',success:false,error:error.message,rehearsalCleanup:ctx.rehearsalCleanup,preInstallProtection:false,rollback:{attempted:false,completed:false,performed:false},recovery_required:false};
+    }
   }
   if(!deps.preInstallSteps && eligible) {
     try {beginUpgrade(ctx,{zylosDir:deps.zylosDir ?? ZYLOS_DIR,skillsDir:deps.skillsDir ?? SKILLS_DIR},deps.step3);}
-    catch(error){return {action:'self_upgrade',success:false,error:error.message,preInstallProtection:false,rollback:{attempted:false,completed:false,performed:false},recovery_required:!!ctx.transactionDir};}
+    catch(error){return {action:'self_upgrade',success:false,error:error.message,rehearsalCleanup:ctx.rehearsalCleanup,preInstallProtection:false,rollback:{attempted:false,completed:false,performed:false},recovery_required:!!ctx.transactionDir};}
   } else if (!eligible && !deps.preInstallSteps) {
     try {beginBackupOnly(ctx,{zylosDir:deps.zylosDir ?? ZYLOS_DIR,skillsDir:deps.skillsDir ?? SKILLS_DIR});}
-    catch(error){return {action:'self_upgrade',success:false,error:error.message,preInstallProtection:false,rollback:{attempted:false,completed:false,performed:false}};}
+    catch(error){return {action:'self_upgrade',success:false,error:error.message,rehearsalCleanup:ctx.rehearsalCleanup,preInstallProtection:false,rollback:{attempted:false,completed:false,performed:false}};}
   }
 
   const preInstallSteps = deps.preInstallSteps ?? [
@@ -1829,7 +1849,8 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps 
       steps: ctx.steps,
       backupDir: finalizeResult.backupDir || ctx.backupDir,
       dbBackupDir:finalizeResult.dbBackupDir || ctx.dbBackupDir || null,
-      databases:finalizeResult.databases || ctx.dbManifest?.databases || null,
+      databases:finalizeResult.databases || ctx.databasePreflight?.databases || ctx.dbManifest?.databases || null,
+      ...(ctx.rehearsalCleanup ? {rehearsalCleanup:ctx.rehearsalCleanup} : {}),
     };
   } catch (err) {
     const error = err.stderr?.toString().trim() || err.message;

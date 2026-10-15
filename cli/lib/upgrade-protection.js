@@ -23,7 +23,7 @@ export function deployUpgradeBootstrap(root) {
     mode: 0o700
   });
   const metaStat = fs.lstatSync(meta);
-  if (!metaStat.isDirectory() || metaStat.isSymbolicLink() || process.getuid && metaStat.uid !== process.getuid()) throw Error('unsafe deployment metadata directory');
+  if (!metaStat.isDirectory() || metaStat.isSymbolicLink()) throw Error('unsafe deployment metadata directory');
   maintenance.fsyncDir(root);
   const dest = path.join(meta, 'upgrade');
   fs.mkdirSync(dest, {
@@ -103,6 +103,7 @@ export function beginUpgrade(ctx, {
     from: ctx.from,
     to: ctx.to,
     phase: 'preparing',
+    databaseMode: ctx.databaseMode === 'unchanged' ? 'unchanged' : 'migrate',
     installationIntent: false,
     automaticCompensation: true,
     automaticResume: process.platform !== 'darwin',
@@ -215,14 +216,15 @@ export function prepareBackupOnlyInstall(ctx, deps = {}) {
     // stop may partially succeed before throwing; the cleanup covers it too.
     (deps.stop ?? maintenance.stopBackupOnly)(j);
     ctx.servicesStopped = [...ctx.servicesWereRunning];
+    const verifySnapshot=deps.verifySnapshot ?? runCoreDbWorker;
     const snapshot = (deps.snapshot ?? createCoreDbSnapshot)({
       zylosDir, transactionId: 'backup-' + Date.now() + '-' + crypto.randomBytes(6).toString('hex'),
-      fromVersion: ctx.from, toVersion: ctx.to
+      fromVersion: ctx.from, toVersion: ctx.to, verifySnapshot
     });
     ctx.dbBackupDir = snapshot.dbBackupDir;
     ctx.dbManifest = snapshot.manifest;
     ctx.backupWarnings = snapshot.warnings;
-    (deps.verifySnapshot ?? runCoreDbWorker)({action:'verify', zylosDir, dbBackupDir:snapshot.dbBackupDir, manifest:snapshot.manifest});
+    if (deps.snapshot) verifySnapshot({action:'verify', zylosDir, dbBackupDir:snapshot.dbBackupDir, manifest:snapshot.manifest});
     ctx.dbSnapshotVerified = true;
   } catch (error) {
     // This boundary precedes npm and only reads business databases. Restore
@@ -288,15 +290,19 @@ export function prepareProtectedInstall(ctx, overrides = {}) {
   maintenance.update(dir, j, {
     phase: 'offline'
   });
+  const verifySnapshot=overrides.verifySnapshot ?? runCoreDbWorker;
   const snapshot = (overrides.snapshot ?? createCoreDbSnapshot)({
     zylosDir: j.zylosDir,
     transactionId: j.transactionId,
     fromVersion: j.from,
-    toVersion: j.to
+    toVersion: j.to,
+    verifySnapshot
   });
   ctx.dbBackupDir = snapshot.dbBackupDir;
   ctx.dbManifest = snapshot.manifest;
   ctx.backupWarnings = snapshot.warnings;
+  if (overrides.snapshot) verifySnapshot({action:'verify',zylosDir:j.zylosDir,dbBackupDir:snapshot.dbBackupDir,manifest:snapshot.manifest});
+  ctx.dbSnapshotVerified = true;
   maintenance.update(dir, j, {
     phase: 'snapshot_saved',
     dbBackupDir: snapshot.dbBackupDir,
@@ -333,8 +339,10 @@ export function prepareProtectedInstall(ctx, overrides = {}) {
     phase: 'runner_saved'
   });
   maintenance.validateDescriptor(dir, j, descriptor);
-  const checked = maintenance.preflight(dir, j, snapshot.manifest);
-  if (checked.success === false) throw Error(checked.error || 'saved readonly worker self-check failed');
+  if (j.databaseMode !== 'unchanged') {
+    const checked = maintenance.preflight(dir, j, snapshot.manifest);
+    if (checked.success === false) throw Error(checked.error || 'saved readonly worker self-check failed');
+  }
   maintenance.update(dir, j, {
     phase: 'prepared',
   });
@@ -472,10 +480,13 @@ export function protectedDataReady(ctx, overrides = {}) {
   if(j.phase!=='installing' || j.installationIntent!==true || j.transactionId!==ctx.transactionId) throw Error('data-ready requires own installing transaction');
   // This function runs in the newly installed finalizer. Use its worker, not
   // the frozen snapshot worker whose code predates the installed migrations.
-  (overrides.migrate ?? runCoreDbWorker)({action:'upgrade-migrate',zylosDir:j.zylosDir,schemaRoot:j.skillsDir,transactionDir:dir,transactionId:j.transactionId});
-  (overrides.verify ?? runCoreDbWorker)({action:'offline-preflight',zylosDir:j.zylosDir,schemaRoot:j.skillsDir,requireCurrent:true});
-  const checked = maintenance.preflight(dir, j, null);
-  if (checked.success === false) throw Error(checked.error || 'new code offline preflight failed');
+  if (j.databaseMode !== 'unchanged') {
+    (overrides.migrate ?? runCoreDbWorker)({action:'upgrade-migrate',zylosDir:j.zylosDir,schemaRoot:j.skillsDir,transactionDir:dir,transactionId:j.transactionId});
+    const verified=(overrides.verify ?? runCoreDbWorker)({action:'offline-preflight',zylosDir:j.zylosDir,schemaRoot:j.skillsDir,requireCurrent:true});
+    ctx.databases=verified?.databases || null;
+    const checked = maintenance.preflight(dir, j, null);
+    if (checked.success === false) throw Error(checked.error || 'new code offline preflight failed');
+  }
   const current=maintenance.transaction(j.zylosDir,dir);
   const marker=maintenance.read(path.join(j.zylosDir,'.zylos/upgrade/active.json'));
   if(current.phase!=='installing' || current.installationIntent!==true || current.transactionId!==j.transactionId || marker.transactionId!==j.transactionId || marker.transactionDir!==dir) throw Error('active migration transaction changed before data-ready');

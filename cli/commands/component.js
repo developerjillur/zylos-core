@@ -18,7 +18,7 @@ import {
 import { detectChanges } from '../lib/manifest.js';
 import { parseSkillMd } from '../lib/skill.js';
 import { linkBins, unlinkBins } from '../lib/bin.js';
-import { removeCaddyRoutes } from '../lib/caddy.js';
+import { removeCaddyRoutes, checkCaddyRouteMarkers } from '../lib/caddy.js';
 import { acquireLock, releaseLock } from '../lib/lock.js';
 import { fetchRawFile } from '../lib/github.js';
 import { promptYesNo } from '../lib/prompts.js';
@@ -49,6 +49,9 @@ export function printStep(step) {
     for (const line of (step.caddy.manualConfig || '').split('\n')) {
       console.log(line);
     }
+  }
+  if (step.name === 'caddy_routes' && step.notice) {
+    console.log(`       ${yellow(step.notice)}`);
   }
 }
 
@@ -94,9 +97,10 @@ export function formatC4Reply(type, data) {
       return r;
     }
     case 'upgrade': {
-      const { component, success, from, to, changelog, failedStep, error, rollback, mergeConflicts, mergedFiles } = data;
+      const { component, success, from, to, changelog, failedStep, error, rollback, mergeConflicts, mergedFiles, skill } = data;
       if (!success) {
-        let r = `${component} upgrade failed (step ${failedStep}): ${error}`;
+        const failureLabel = failedStep === 0 ? 'upgrade preflight failed' : `upgrade failed (step ${failedStep})`;
+        let r = `${component} ${failureLabel}: ${error}`;
         if (rollback?.performed) {
           r += '\nRollback: ' + (rollback.steps || []).map(s => `${s.success ? 'OK' : 'FAIL'}: ${s.action}`).join(', ');
         }
@@ -119,6 +123,7 @@ export function formatC4Reply(type, data) {
           r += `\n\nOverwritten without backup (${withoutBackup.length}): ${withoutBackup.map(c => c.file).join(', ')}`;
         }
       }
+      if (skill?.caddy?.notice) r += `\n\nCaddy routes: ${skill.caddy.notice}`;
       return r;
     }
     case 'self-upgrade': {
@@ -228,6 +233,7 @@ export function formatC4Reply(type, data) {
         for (const s of steps) {
           const icon = s.success ? 'OK' : 'skipped';
           r += `\n  ${s.action}: ${icon}`;
+          if (s.notice) r += ` — ${s.notice}`;
         }
       }
       return r;
@@ -242,6 +248,8 @@ export function formatC4Reply(type, data) {
 // Shared human/C4 details preserve the independent upgrade and recovery outcomes.
 export function formatSelfUpgradeProtection(data) {
   const lines=[];
+  for(const dir of data.rehearsalCleanup?.removed || [])lines.push(`Removed rehearsal copy: ${dir}`);
+  for(const warning of data.rehearsalCleanup?.warnings || [])lines.push(`Rehearsal cleanup warning: ${warning}`);
   if(data.backupOnly){
     lines.push(`Database snapshot: ${data.dbSnapshotVerified?'verified':'not verified; installation not started'}`);
     lines.push('Automatic database recovery: disabled; recovery is manual');
@@ -252,11 +260,16 @@ export function formatSelfUpgradeProtection(data) {
     for(const warning of data.backupWarnings||[])lines.push(`Backup warning: ${warning}`);
   }
   if(typeof data.preInstallProtection==='boolean')lines.push(`Pre-install protection: ${data.preInstallProtection?'enabled':'unavailable'}`);
+  if(data.preInstallProtection && data.dbSnapshotVerified)lines.push('Database snapshot: verified');
   if(data.automaticCompensation===true)lines.push('Automatic compensation: available for observed failures after writer exit is confirmed');
   if(data.automaticResume===false)lines.push('Interrupted upgrade: manual recovery required; automatic takeover is disabled');
   if(data.dbBackupDir)lines.push(`Database snapshots: ${data.dbBackupDir}`);
   const databases=data.databases||data.dbManifest?.databases;
-  if(Array.isArray(databases))for(const db of databases)lines.push(`  ${db.source}: ${db.status}${db.userVersion!=null?` (schema ${db.userVersion})`:''}`);
+  if(Array.isArray(databases))for(const db of databases){
+    lines.push(`  ${db.source}: ${db.status}${db.userVersion!=null?` (schema ${db.userVersion})`:''}`);
+    for(const table of db.extensions?.tables || [])lines.push(`    Accepted extra table: ${table}`);
+    for(const {table,column} of db.extensions?.columns || [])lines.push(`    Accepted extra column: ${table}.${column}`);
+  }
   if(data.transactionDir)lines.push(`Recovery materials: ${data.transactionDir}`);
   if(data.archiveDir)lines.push(`Archived recovery materials: ${data.archiveDir}`);
   const rb=data.rollback;
@@ -792,7 +805,8 @@ async function handleUpgradeFlow(component, { jsonOutput, skipConfirm, skipEval,
         console.log(`\n${heading('Changelog:')}\n${changelog}`);
       }
     } else {
-      console.log(`\n${error(`Upgrade failed (step ${result.failedStep}): ${result.error}`)}`);
+      const failureLabel = result.failedStep === 0 ? 'Upgrade preflight failed' : `Upgrade failed (step ${result.failedStep})`;
+      console.log(`\n${error(`${failureLabel}: ${result.error}`)}`);
 
       if (result.rollback?.performed) {
         console.log(`\n${bold('Auto-rollback performed:')}`);
@@ -1451,6 +1465,20 @@ async function handleRemoveFlow(target, { purge, skipConfirm, force, jsonOutput 
     }
   }
 
+  // Reject unpaired route markers before the pre-uninstall hook, service stop,
+  // or any file removal. A missing Caddyfile is allowed.
+  const markerCheck = checkCaddyRouteMarkers(target);
+  if (!markerCheck.success) {
+    if (jsonOutput) {
+      const output = { action: 'uninstall', component: target, success: false, error: markerCheck.error };
+      output.reply = formatC4Reply('error', { message: markerCheck.error });
+      console.log(JSON.stringify(output, null, 2));
+    } else {
+      console.error(error(markerCheck.error));
+    }
+    return false;
+  }
+
   // Execute removal, collect step results
   const steps = [];
 
@@ -1496,10 +1524,16 @@ async function handleRemoveFlow(target, { purge, skipConfirm, force, jsonOutput 
   }
 
   // 2.5. Remove Caddy routes
-  const caddyResult = removeCaddyRoutes(target);
+  let caddyResult;
+  try {
+    caddyResult = removeCaddyRoutes(target);
+  } catch (err) {
+    caddyResult = { success: false, action: 'skipped', error: `Caddy route removal skipped: ${err.message}` };
+  }
   if (caddyResult.success && caddyResult.action === 'removed') {
-    steps.push({ action: 'Caddy routes removed', success: true });
+    steps.push({ action: 'Caddy routes removed', success: true, notice: caddyResult.notice });
     if (!jsonOutput) console.log(`  ${success('Caddy routes removed')}`);
+    if (!jsonOutput && caddyResult.notice) console.log(`  ${warn(caddyResult.notice)}`);
   } else if (caddyResult.action === 'not_found') {
     // No routes to remove — skip silently
   } else if (!caddyResult.success) {

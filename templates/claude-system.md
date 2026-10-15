@@ -129,10 +129,19 @@ already this session.
 
 - **Sedimenting a reusable workflow for the user** (a repeatable capability,
   not a one-off task)? Read `~/zylos/.claude/skills/create-skill/SKILL.md`
-  first if you have not already this session.
+  first if you have not already this session. Use it for skill content;
+  follow the component workflow below for packaging and installation.
 - **User wants a problem solved without specifying how?** First run
   `zylos search` to check for an existing component; only if nothing fits,
   look for safe, reviewed solutions elsewhere.
+- **Developing a persistent service or skill for this Zylos host?**
+  Default to implementing and packaging it as a standard Zylos component
+  (https://github.com/zylos-ai/zylos-component-template), for user requests
+  and your own plans. Choose this workflow without asking; install via
+  the Zylos CLI under existing approval rules. Do not hand-edit
+  `~/zylos/pm2/ecosystem.config.cjs`: Zylos may regenerate it. Work
+  deployed elsewhere is exempt; core generation and component lifecycle
+  operations remain allowed.
 
 ## Version & System Info
 

@@ -1,15 +1,22 @@
 # Protected self-upgrade and file-only recovery
 
-Protected upgrades snapshot `comm-bridge/c4.db`, `scheduler/scheduler.db`, and
-`web-console/web-console.db` before npm installation. A failed protected
-installation or finalizer restores declared core skill directories, the original
-PM2 ecosystem, and these databases using a saved independent runner. The command
-still reports that the upgrade failed; compensation has its own result.
+Every Core upgrade snapshots
+`comm-bridge/c4.db`, `scheduler/scheduler.db`, and `web-console/web-console.db`
+after stopping services and before npm installation. When migration is needed,
+a failed protected installation or finalizer restores
+declared core skill directories, the original PM2 ecosystem, and these databases
+using a saved independent runner. If all three database versions already match
+the target release, the upgrade skips rehearsal, migration, and upgrade database checks.
+It still creates and verifies the database snapshots before installation. On
+same-version failure, automatic recovery restores code and services but does
+not restore the databases. The retained snapshot is available for manual
+database recovery. The command still reports
+a failed upgrade if compensation runs.
 
 ## Backup and automatic recovery are separate capabilities
 
-Every supported self-upgrade path requires a verified preinstall snapshot of the
-three core databases. Automatic recovery additionally requires controller
+Every self-upgrade requires a verified preinstall snapshot of all three
+databases, including when schema versions match. Automatic recovery additionally requires controller
 ownership and recovery publication; Linux crash takeover also requires process
 identity. The command selects one of two modes:
 
@@ -18,9 +25,10 @@ identity. The command selects one of two modes:
   interrupted recovery; macOS requires the original upgrade controller to remain
   alive and treats interrupted ownership as manual recovery.
 - **Backup-only upgrade:** `backupOnly=true`, `preInstallProtection=false`,
-  `automaticRecovery=false`. Installation can proceed only after services and
-  known writers have stopped and the database snapshot has been created and
-  verified. Database and code recovery after failure are manual.
+  `automaticRecovery=false`. Installation can proceed
+  only after services and known writers have stopped and the database snapshot
+  has been created and verified. Database and code recovery after failure are
+  manual.
 
 On Linux, missing trusted `flock` or usable `/proc` process identity disables
 automatic recovery, not the required database backup. macOS uses the existing
@@ -49,11 +57,69 @@ stop checks, or automatic recovery from an interrupted upgrade. Avoid concurrent
 administrative writers during the operation.
 
 Before either upgrade mode publishes a transaction or stops services, it checks
-for unresolved recovery work, then probes the snapshot destination and Node sync,
-loads each owner's SQLite driver, and checks existing databases read-only against
-the recognized starting schema and complete registered migration path. This check
-does not run migrations or stamp versions. Failure rejects the upgrade while original services
-remain running. Protected upgrades also freeze recovery dependencies before stop.
+for unresolved recovery work and reads each existing database's SQLite
+`user_version` through a readonly connection. It compares those values with
+the downloaded release's declared schema versions. A missing database counts as
+needing migration; a version newer than the target is rejected. If all three
+versions match, the upgrade skips database preflight, rehearsal, migration and
+structural checks. After service stop, it creates and verifies all three
+database snapshots before install. A target release without this fast path
+runs its own finalizer after installation. The 0.9.0 protected finalizer runs
+its own migration and database checks; 0.8.x finalizers reject the newer
+protected handoff state before those checks. Either failure triggers protected
+compensation. Backup-only failures require manual recovery.
+
+If any database needs migration, both upgrade modes probe the snapshot
+destination and Node sync, load each owner's SQLite driver, and check existing
+databases read-only for supported versions, SQLite integrity and a complete
+registered migration path. They rehearse the target migration chain on isolated
+copies made with the SQLite backup API while services remain running. A failed
+rehearsal rejects the upgrade before service stop. A passed rehearsal is an
+early warning check; live databases may change during it. Protected upgrades
+also freeze recovery dependencies before stop.
+
+When migration is needed, the downloaded target must contain the rehearsal
+worker and schema code. A target without them is rejected before service stop,
+including when selected with `--branch` to test an older release. Rehearsal copies use the private
+0700 directory `.backup/db/.rehearsal` under the Zylos data directory.
+The updater removes it on normal exit or worker timeout. An abrupt kill can
+leave it behind. Before each subsequent upgrade, the updater checks that this
+directory and legacy `.rehearsal-*` copies are real directories owned by the
+current user, then removes them before stopping services. Unsafe entries block
+the upgrade. Formal snapshot groups are outside this rehearsal cleanup.
+
+### Local schema extensions
+
+Additional tables and columns in all three core databases are accepted and
+reported by database, table, and column. They are included in the rehearsal
+copies and verified snapshots. The `--allow-schema-extensions` option has been
+removed; the ordinary upgrade approval covers the reported changes. Starting
+with schema version 1→2, declared steps check that existing table and column
+names survive unless the step declares their removal. A declared deletion of a
+core table is rejected if that table has undeclared columns; the operator must
+resolve that conflict outside the upgrade. A new core table or column name
+already occupied by user data is also rejected. The legacy 0→1 transition has
+no per-step change declaration or collision and preservation checks. Its result
+must satisfy the required v1 core schema.
+
+For declared steps, retained columns keep their SQLite type, `NOT NULL`,
+default, primary-key position, and generated/hidden metadata unless a core
+definition change is declared in `alterColumns`. Upgrade preflight and rehearsal
+reject a user-added ordinary `NOT NULL` column without a usable default in a
+core table before service stop. Ordinary database open permits it so an agent
+can help repair the schema, though writes to that table may fail with SQLite's
+column-specific `NOT NULL constraint failed` error. These checks cover table
+and column names, retained column metadata, and row counts. They do not inspect
+indexes, triggers, or views; rebuilding a core table can lose user-created
+indexes or triggers. They also cannot detect a semantic change to rows when
+the count stays the same. Review dependent objects and meaningful row content
+when planning a schema migration.
+
+The allowance does not bypass an unsupported schema version, a missing
+migration step, a failed SQLite integrity check, a missing/corrupt/hash-mismatched
+backup, or the applicable per-step and final schema checks. Show the owner the
+reported extensions and any conflict as part of the ordinary upgrade review. A failed
+check stops or rolls back the upgrade under the recovery rules below.
 
 Backup-only service-stop, writer-drain, snapshot or snapshot-verification failures
 abort before installation. The command restarts only the service records that
@@ -102,6 +168,17 @@ manual recovery if this first upgrade fails; it does not give the old updater
 automatic restoration. Installing this package alone does not enable a boot
 service or establish persisted runtime authentication.
 
+The same first-adoption limit applies to the schema-extension policy: an
+installed updater without this change may still reject additional tables or
+columns before it installs the target release. No option in the new release can
+change that old preflight. If it blocks on extension tables, first make and verify
+complete backups, account for every row in those tables, and arrange a temporary
+relocation outside the three core databases under an operator-approved plan.
+Run the existing protected upgrade only after the old preflight passes; decide
+whether to restore the extension tables after the new code is installed. Do not
+delete or discard extension data merely to pass preflight. Extra columns require
+a separately reviewed plan because relocating a table can affect core data.
+
 Existing operator-owned `.zylos` and `.backup` parent directories may retain
 legacy permissions and supported directory aliases. Without an explicit active
 marker, ordinary database openers, runtime startup, C4 context and PM2-save guards
@@ -146,10 +223,11 @@ frozen recovery code within the same attempt. A child-process exit alone is not
 proof that all detached descendants have exited; the existing process-group
 checks remain required.
 
-Both platforms retain preinstall three-database snapshots, schema checks, service
-isolation and frozen recovery materials. macOS does not provide unattended
-crash/reboot takeover. When backup-only mode is selected, the required snapshot
-still precedes installation. Failures while setting up an already selected
+Both platforms retain preinstall three-database snapshots; migration paths also
+run schema checks. Service isolation and frozen protected-recovery
+materials apply to both migration and code-only upgrades. macOS does not provide unattended
+crash/reboot takeover. In backup-only mode, every upgrade requires a
+verified snapshot before installation. Failures while setting up an already selected
 protected transaction abort that attempt rather than silently changing modes.
 
 The new Mac path requires no compiler, native recovery binary or new Node addon.
@@ -235,17 +313,20 @@ Protected results distinguish `automaticCompensation` from `automaticResume`.
 On macOS the former is true and the latter false: a completed ordinary failure
 compensation does not imply that a new process can take over after interruption.
 
-JSON, human output, and C4 replies expose snapshot paths, per-database missing or
-backed-up states, schema versions and protection status. Backup-only output
-explicitly identifies disabled automatic recovery, snapshot verification status,
+JSON, human output, and C4 replies expose snapshot paths, verification status,
+rehearsal cleanup, and per-database states when available.
+Backup-only output explicitly identifies disabled automatic recovery, snapshot verification status,
 and manual recovery instructions. A failed attempt requires manual inspection;
 this is not a claim that a database restore is always necessary. Protected output
 also exposes transaction paths and separate recovery
 attempted/completed/stage/error values. Cleanup warnings
 do not turn a verified terminal success into a compensation request.
+Schema-extension reports identify each affected database, table, and extra
+column. A name collision or undeclared loss reports the affected object and
+blocks the upgrade; there is no schema-extension opt-in command.
 
-Backup-only attempts retain database snapshots and code backup material for
-manual recovery, including after successful installation. They do not have the
+Backup-only attempts retain database snapshots and code backup material
+for manual recovery, including after successful installation. They do not have the
 transaction journals or rescue runner described below.
 
 Successful protected-upgrade cleanup removes only the fixed transaction `code/` copy,
@@ -264,7 +345,8 @@ and explicit `--status`/`--once` retain detailed discovery and refuse unresolved
 or damaged material. A journal abandoned before marker publication has not stopped
 services or installed code; it does not isolate daily use, but must be resolved
 before another upgrade. No terminal archive or cleanup pointer is created. Snapshots, rescue material and journals remain.
-Snapshot retention keeps the newest complete feature-owned group (N=1); cleanup
+Snapshot retention verifies the newly published group before retiring an older
+verified group, then keeps the newest complete feature-owned group (N=1); cleanup
 failures leave warnings and paths. Private database snapshots are normalized to
 SQLite DELETE journal mode before their SHA-256 is recorded, so readonly snapshot
 inspection needs no temporary copy and creates no WAL sidecars.
@@ -284,21 +366,44 @@ package downgrade.
 
 ## Daily compatibility and active isolation
 
-Normal owner openers check supported versions and required table/column definitions.
-Additional tables or columns are permitted, including during a supported legacy
-migration. Missing required fields, invalid/future versions and incompatible required
-definitions are still rejected. The pure owner `inspectSchema()` API remains strict
-by default; upgrade/recovery workers use that strict path. An extension may therefore
-continue to work daily while preventing this updater from safely upgrading it.
+Normal owner openers check supported versions and, at the current version,
+required table/column definitions. Additional tables or columns are permitted.
+Invalid or future versions are rejected; missing or incompatible required v1
+fields are rejected after the legacy migration. The pure owner `inspectSchema()`
+API remains strict by default for extra tables and columns at the current
+version. Upgrade and recovery workers use migration-step checks from version 1
+onward; normal opening alone does not prove migration compatibility.
 
 Each owner registers explicit adjacent transitions (`MIGRATIONS`), currently 0→1
 for all three databases; the supported target remains 1. Unmarked historical
-schemas start at 0. The planner recognizes that starting version's layout and
-resolves the entire path before changing anything. After taking the SQLite writer
-lock it plans again, then runs all steps and validates each resulting version in
-one transaction per database. A failed step or target check rolls back structure,
-data and `user_version` together. There is no cross-database atomic transaction.
-A database already at the target is inspected without rerunning migration callbacks.
+schemas start at 0. Code retains the latest complete core schema. The legacy
+0→1 callback has no change declaration or per-step collision, structure, or
+row-count checks; its result must satisfy the required v1 schema. Beginning
+with 1→2, each callback must declare added, deleted, and renamed tables and
+columns, altered core column definitions, and any tables whose row counts may
+change.
+An `alterColumns` entry permits an intentional change to a retained core column
+definition. Its value is keyed by table and column, with the complete resulting
+`{type, pk, notnull, default}` definition (`default` is the SQLite SQL expression,
+or `null` for no default). The column must belong to the core schema at the
+source version; unlisted retained columns must keep their SQLite metadata. Complete
+historical schema copies are not required in production code. The planner resolves a
+continuous path from the current version to the target before changing
+anything. After taking the SQLite writer lock it plans again, then runs every
+step in one transaction per database. For declared steps from 1→2 onward, it
+rejects occupied new core names before the step and checks afterward that
+undeclared table and column names remain, retained column metadata matches,
+and undeclared row counts are unchanged. It checks the latest required core
+schema before commit. A failed
+step or target check rolls back structure, rows and `user_version` together.
+There is no cross-database atomic
+transaction. If a later database fails after an earlier one committed, protected
+upgrade compensation restores all three databases from the verified preinstall
+snapshot and restores the protected code; backup-only mode requires manual
+recovery. The global npm CLI may remain newer after protected compensation.
+When another database needs migration, a database already at the target is
+inspected without rerunning migration callbacks. If all three are current,
+the upgrade skips this worker entirely.
 
 After installation, before READY, a dedicated worker loads the installed owners'
 registries and performs the migration while the active installing journal still
@@ -308,9 +413,19 @@ the existing snapshot compensation boundaries. Recovery inspection remains read-
 
 Historical fixture tests cover representative C4 source layouts from v0.1.0,
 v0.4.11 and v0.5.2, scheduler v0.1.0, web-console v0.5.3, and absent web-console
-storage. Exact source hashes and extraction rules accompany the SQL fixtures.
-The separate 0→1→2 tests are synthetic engine tests; no released schema version 2
-is implied, and source comparison is not execution of every historical release.
+storage. They also cover all three v1 databases produced by the v0.9.0 tagged
+migration callbacks, seeded with synthetic rows and exercised through a
+synthetic v1→v2 step. Exact source hashes and extraction rules accompany the SQL fixtures.
+Multi-version chain tests are synthetic engine tests; no released schema version
+2 or later is implied. The historical samples come from selected release source
+layouts, not every evolved database on a deployed host. For each future released
+database version, retain a sample database and content assertions. Until CI is
+configured, the implementer runs these tests before merge, the reviewer reruns
+them, and the release checklist requires them to pass and adds samples for the
+new release. These checks do not cover indexes, triggers, or views; a core table
+rebuild can lose user-created indexes or triggers. They also cannot detect an
+incorrect `UPDATE` that preserves the row count. Sample assertions can catch
+known regressions; verified snapshots allow recovery if a problem is found.
 
 The active marker is durable before service stop, installation or database replacement.
 Only the referenced journal's validated data-ready, verified provisional abort or

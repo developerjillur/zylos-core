@@ -52,7 +52,68 @@ export function preflightCoreDbUpgrade(zylosDir) {
   probeCoreDbSnapshotSync(destination);
   return runCoreDbWorker({action: 'offline-preflight', zylosDir});
 }
-export function createCoreDbSnapshot({zylosDir,transactionId,fromVersion,toVersion,onProgress}) {
+// Compare only SQLite user_version with the downloaded release's declared
+// versions. This is the sole pre-stop live-database read when versions match.
+export function probeCoreDbVersions(zylosDir, tempDir, {driverRoot=path.join(zylosDir,'.claude','skills')}={}) {
+  const schemaRoot=path.join(tempDir,'skills');
+  return runCoreDbWorker({action:'version-probe',zylosDir,schemaRoot,driverRoot});
+}
+// Clear a fixed-name rehearsal left by an interrupted upgrade, plus older
+// random-name copies. Refuse ambiguous paths before stopping services.
+export function cleanupCoreDbRehearsals(zylosDir) {
+  const removed=[];
+  const root=path.join(zylosDir,'.backup','db');
+  for(const dir of [path.join(zylosDir,'.backup'),root]) {
+    let stat;
+    try {stat=fs.lstatSync(dir);} catch(error) {if(error.code==='ENOENT') return {removed};throw error;}
+    if(!stat.isDirectory()||stat.isSymbolicLink()) throw Error(`Unsafe rehearsal cleanup directory: ${dir}`);
+  }
+  const candidates=[];
+  for(const name of fs.readdirSync(root)) {
+    if(name!=='.rehearsal'&&!/^\.rehearsal-[A-Za-z0-9_-]+$/.test(name)) continue;
+    const dir=path.join(root,name);
+    const stat=fs.lstatSync(dir);
+    if(!stat.isDirectory()||stat.isSymbolicLink()) throw Error(`Unsafe rehearsal copy: ${dir}`);
+    candidates.push(dir);
+  }
+  for(const dir of candidates) {
+    try {fs.rmSync(dir,{recursive:true});}
+    catch(error) {error.removedRehearsals=removed;throw error;}
+    removed.push(dir);
+  }
+  return {removed};
+}
+// Run the downloaded release's real migration code against SQLite online
+// backup copies while services are still running. This is an early warning;
+// the stopped, snapshotted databases are migrated and checked again later.
+export function rehearseCoreDbUpgrade(zylosDir, tempDir, {driverRoot=path.join(zylosDir,'.claude','skills'),onCleanup}={}) {
+  const schemaRoot=path.join(tempDir,'skills');
+  const workerPath=path.join(tempDir,'cli','lib','core-db-backup-worker.js');
+  if (!fs.existsSync(workerPath) || !fs.existsSync(path.join(schemaRoot,'comm-bridge','scripts','sqlite-schema.js'))) {
+    throw new Error('Target release does not provide database rehearsal code');
+  }
+  // Keep complete chat/database copies under Zylos's private backup tree.
+  // Parent cleanup also covers a worker timeout; an abrupt parent kill leaves
+  // the copies in this known local directory rather than the system temp area.
+  for (const relative of ['.backup','.backup/db']) {
+    const directory=path.join(zylosDir,relative);
+    try {
+      const stat=fs.lstatSync(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw Error('Unsafe database rehearsal destination: '+directory);
+    } catch(error) {
+      if (error.code!=='ENOENT') throw error;
+      fs.mkdirSync(directory,{mode:0o700});
+    }
+  }
+  const cleanup=cleanupCoreDbRehearsals(zylosDir);
+  onCleanup?.(cleanup);
+  const rehearsalDir=path.join(zylosDir,'.backup','db','.rehearsal');
+  fs.mkdirSync(rehearsalDir,{mode:0o700});
+  fs.chmodSync(rehearsalDir,0o700);
+  try {return runCoreDbWorker({action:'rehearse',zylosDir,schemaRoot,driverRoot,rehearsalDir},{workerPath});}
+  finally {fs.rmSync(rehearsalDir,{recursive:true,force:true});}
+}
+export function createCoreDbSnapshot({zylosDir,transactionId,fromVersion,toVersion,onProgress,verifySnapshot=runCoreDbWorker}) {
   if(!/^[a-zA-Z0-9_-]+$/.test(transactionId)) throw new Error('Invalid snapshot transaction ID');
   const root=path.join(zylosDir,'.backup','db');fs.mkdirSync(root,{recursive:true,mode:0o700});
   syncDir(path.dirname(root));syncDir(zylosDir);
@@ -65,6 +126,8 @@ export function createCoreDbSnapshot({zylosDir,transactionId,fromVersion,toVersi
     durableJson(path.join(staging,'manifest.json'),manifest);
     const destination=path.join(root,transactionId);if(fs.existsSync(destination)) throw new Error(`Snapshot already exists: ${destination}`);
     fs.renameSync(staging,destination);syncDir(root);
+    // Verify the published group before retiring a previously verified one.
+    verifySnapshot({action:'verify',zylosDir,dbBackupDir:destination,manifest});
     const warnings=[];
     for(const entry of fs.readdirSync(root,{withFileTypes:true})) {
       if(!entry.isDirectory()||entry.name===transactionId||entry.name.startsWith('.')) continue;
